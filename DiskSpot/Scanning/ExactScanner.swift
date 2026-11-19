@@ -165,10 +165,12 @@ private enum BulkDirectory {
 
     static func read(_ descriptor: Int32, buffer: UnsafeMutableRawBufferPointer, _ body: (DirectoryEntry) -> Void) -> Bool {
         var request = attributes
+        var delivered = false
         while true {
             let count = getattrlistbulk(descriptor, &request, buffer.baseAddress, buffer.count, UInt64(FSOPT_RETURN_REALDEV))
             if count == 0 { return true }
-            if count < 0 { return false }
+            if count < 0 { return delivered ? false : readEntries(descriptor, body) }
+            delivered = true
             var position = 0
             for _ in 0..<count {
                 guard position + MemoryLayout<UInt32>.size <= buffer.count else { return true }
@@ -179,6 +181,26 @@ private enum BulkDirectory {
                 if let entry = decode(record, descriptor: descriptor) { body(entry) }
             }
         }
+    }
+
+    private static func readEntries(_ descriptor: Int32, _ body: (DirectoryEntry) -> Void) -> Bool {
+        let copy = dup(descriptor)
+        guard copy >= 0 else { return false }
+        guard let directory = fdopendir(copy) else {
+            close(copy)
+            return false
+        }
+        defer { closedir(directory) }
+        while let entry = readdir(directory) {
+            let name = withUnsafeBytes(of: &entry.pointee.d_name) { raw in
+                String(decoding: raw.prefix(Int(entry.pointee.d_namlen)), as: UTF8.self)
+            }
+            if name == "." || name == ".." { continue }
+            var info = stat()
+            guard fstatat(descriptor, name, &info, AT_SYMLINK_NOFOLLOW) == 0 else { continue }
+            body(DirectoryEntry(name: name, info: info))
+        }
+        return true
     }
 
     private static func decode(_ record: UnsafeRawBufferPointer, descriptor: Int32) -> DirectoryEntry? {
