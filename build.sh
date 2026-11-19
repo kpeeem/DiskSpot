@@ -13,15 +13,14 @@ xcodebuild \
   -quiet \
   build
 
+PRODUCT="build/DerivedData/Build/Products/$CONFIG/DiskSpot.app"
+IDENTITY="${SIGN_IDENTITY:-$(security find-identity -v -p codesigning | awk '/\)/ {print $2; exit}')}"
+if [[ -n "$IDENTITY" ]]; then
+  codesign --force --deep --sign "$IDENTITY" "$PRODUCT"
+fi
+
 APP=build/DiskSpot.app
 [[ "$CONFIG" == Release ]] || APP=build/DiskSpot-$CONFIG.app
 rm -rf "$APP"
-cp -R "build/DerivedData/Build/Products/$CONFIG/DiskSpot.app" "$APP"
-
-# Ad-hoc signatures change on every build and macOS then forgets the Full Disk Access grant.
-# A certificate-based signature keeps the grant across rebuilds.
-IDENTITY="${SIGN_IDENTITY:-$(security find-identity -v -p codesigning | awk '/\)/ {print $2; exit}')}"
-if [[ -n "$IDENTITY" ]]; then
-  codesign --force --deep --sign "$IDENTITY" "$APP"
-fi
+cp -R "$PRODUCT" "$APP"
 echo "Готово: $(pwd)/$APP"
