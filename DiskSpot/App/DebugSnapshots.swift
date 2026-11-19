@@ -17,6 +17,9 @@ enum DebugSnapshots {
                 log("probe \(probe) \(Format.bytes(node?.size ?? -1)) in \(Int(Date().timeIntervalSince(started)))s: \(children)")
             }
         }
+        if let folder = environment["DISKSPOT_FOLDER"] {
+            model.open(folder: URL(fileURLWithPath: folder))
+        }
         guard let prefix = environment["DISKSPOT_SNAPSHOT"] else { return }
         let exactTarget = environment["DISKSPOT_EXACT"]
         let zoomTarget = environment["DISKSPOT_ZOOM"]
