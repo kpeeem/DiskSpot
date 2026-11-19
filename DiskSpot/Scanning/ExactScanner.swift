@@ -13,6 +13,7 @@ final class ScanContext: @unchecked Sendable {
     private var unreadable = 0
     private var cancelled = false
     private var seenLinks = Set<LinkKey>()
+    private var clones: [LinkKey: (references: UInt32, seen: Int, counted: Int64)] = [:]
 
     var isCancelled: Bool { lock.withLock { cancelled } }
 
@@ -32,6 +33,20 @@ final class ScanContext: @unchecked Sendable {
 
     func firstSighting(device: Int32, inode: UInt64) -> Bool {
         lock.withLock { seenLinks.insert(LinkKey(device: device, inode: inode)).inserted }
+    }
+
+    func firstSighting(device: Int32, clone: UInt64, references: UInt32, size: Int64) -> Bool {
+        lock.withLock {
+            let key = LinkKey(device: device, inode: clone)
+            var family = clones[key] ?? (references, 0, size)
+            family.seen += 1
+            clones[key] = family
+            return family.seen == 1
+        }
+    }
+
+    var heldByClonesOutside: Int64 {
+        lock.withLock { clones.values.filter { $0.seen < Int($0.references) }.reduce(0) { $0 + $1.counted } }
     }
 }
 
@@ -97,6 +112,8 @@ private struct DirectoryEntry {
     let inode: UInt64
     let links: UInt32
     let allocated: Int64
+    var clone: UInt64 = 0
+    var cloneReferences: UInt32 = 0
     let isDataless: Bool
     let isMountPoint: Bool
 
@@ -138,6 +155,7 @@ private enum BulkDirectory {
         list.commonattr = common | UInt32(ATTR_CMN_ERROR) | ATTR_CMN_RETURNED_ATTRS
         list.dirattr = UInt32(ATTR_DIR_MOUNTSTATUS)
         list.fileattr = file
+        list.forkattr = UInt32(ATTR_CMNEXT_CLONEID | ATTR_CMNEXT_CLONE_REFCNT)
         return list
     }()
 
@@ -165,10 +183,16 @@ private enum BulkDirectory {
 
     static func read(_ descriptor: Int32, buffer: UnsafeMutableRawBufferPointer, _ body: (DirectoryEntry) -> Void) -> Bool {
         var request = attributes
+        var options = UInt64(FSOPT_RETURN_REALDEV | FSOPT_ATTR_CMN_EXTENDED)
         var delivered = false
         while true {
-            let count = getattrlistbulk(descriptor, &request, buffer.baseAddress, buffer.count, UInt64(FSOPT_RETURN_REALDEV))
+            let count = getattrlistbulk(descriptor, &request, buffer.baseAddress, buffer.count, options)
             if count == 0 { return true }
+            if count < 0, errno == EINVAL, request.forkattr != 0, !delivered {
+                request.forkattr = 0
+                options = UInt64(FSOPT_RETURN_REALDEV)
+                continue
+            }
             if count < 0 { return delivered ? false : readEntries(descriptor, body) }
             delivered = true
             var position = 0
@@ -226,7 +250,10 @@ private enum BulkDirectory {
         }
         if complete, type == VREG.rawValue, returned.fileattr & file == file,
            let links = cursor.take(UInt32.self), let allocated = cursor.take(Int64.self) {
-            return DirectoryEntry(name: name, type: type, device: device, inode: inode, flags: flags, links: links, allocated: allocated, mountStatus: 0)
+            var entry = DirectoryEntry(name: name, type: type, device: device, inode: inode, flags: flags, links: links, allocated: allocated, mountStatus: 0)
+            if returned.forkattr & UInt32(ATTR_CMNEXT_CLONEID) != 0 { entry.clone = cursor.take(UInt64.self) ?? 0 }
+            if returned.forkattr & UInt32(ATTR_CMNEXT_CLONE_REFCNT) != 0 { entry.cloneReferences = cursor.take(UInt32.self) ?? 0 }
+            return entry
         }
         var info = stat()
         guard fstatat(descriptor, name, &info, AT_SYMLINK_NOFOLLOW) == 0 else { return nil }
@@ -353,6 +380,11 @@ struct ExactScanner: Sendable {
     }
 
     private func allocatedSize(_ entry: DirectoryEntry) -> Int64 {
+        if entry.isRegular, entry.cloneReferences > 1, entry.clone != 0 {
+            let first = context.firstSighting(device: entry.device, clone: entry.clone | 1 << 63,
+                                              references: entry.cloneReferences, size: entry.allocated)
+            return first ? entry.allocated : 0
+        }
         if entry.isRegular, entry.links > 1, !context.firstSighting(device: entry.device, inode: entry.inode) {
             return 0
         }

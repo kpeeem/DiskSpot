@@ -10,7 +10,7 @@ English · [Русский](details.ru.md)
 
 1. **Spotlight.** A `kMDItemPhysicalSize` query returns big files and bundles in seconds; folder sizes are summed by path.
 2. **Blind spots.** Whatever Spotlight does not index (exclusions, system and service folders) is walked exactly.
-3. **Exact walk.** A shared folder queue keeps every thread busy; entries come in batches from `getattrlistbulk` (`readdir` as a fallback), blocks are counted like `du`, hard links once, mount points are not crossed, iCloud placeholders are never downloaded. Only folders and files above the threshold are kept; the folded tree is built bottom-up.
+3. **Exact walk.** A shared folder queue keeps every thread busy; entries come in batches from `getattrlistbulk` (`readdir` as a fallback), blocks are counted like `du`, hard links and APFS clones once (advice sizes count only what deleting would free), mount points are not crossed, iCloud placeholders are never downloaded. Only folders and files above the threshold are kept; the folded tree is built bottom-up.
 
 | Scanned (under load) | Files | Previous walk | Folder queue |
 |---|---:|---:|---:|

@@ -32,14 +32,13 @@ private func withScanProperties(_ properties: [String: Any]) -> [String: Any] {
 
 
 func adviceSize(_ path: String, store: ScanStore) -> Int64 {
-    for scan in store.all {
-        if let node = scan.root.descendant(at: path, create: false) { return node.size }
-    }
     var info = stat()
     guard lstat(path, &info) == 0 else { return 0 }
     guard info.st_mode & S_IFMT == S_IFDIR else { return Int64(info.st_blocks) * 512 }
-    let scanner = ExactScanner(context: ScanContext(), fileThreshold: .max, folderThreshold: .max)
-    return scanner.scan(path: path)?.size ?? 0
+    let context = ScanContext()
+    let scanner = ExactScanner(context: context, fileThreshold: .max, folderThreshold: .max)
+    guard let node = scanner.scan(path: path) else { return 0 }
+    return node.size - context.heldByClonesOutside
 }
 
 func adviceJSON(_ sheet: AdviceSheet?) -> [String: Any] {
