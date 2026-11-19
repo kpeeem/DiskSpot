@@ -140,6 +140,19 @@ public enum AdviceGuard {
         "/private/tmp/", "/private/var/folders/", "/Library/Caches/", "/Library/Logs/",
         "/Library/Developer/CoreSimulator/Caches", "/Users/Shared/", "/cores/", "/.adobeTemp",
     ]
+    private static let standardInLibrary: Set<String> = [
+        "Apple", "AppStore", "Application Support", "Audio", "AutoBugCapture", "Automator", "Bluetooth", "Bundles", "Caches",
+        "Catacomb", "ColorPickers", "ColorSync", "Components", "Compositions", "Contextual Menu Items", "CoreAnalytics",
+        "CoreMediaIO", "Desktop Pictures", "Developer", "Dictionaries", "DirectoryServices", "Documentation", "DriverExtensions",
+        "Extensions", "Filesystems", "Fonts", "Frameworks", "GPUBundles", "Graphics", "Image Capture", "Input Methods",
+        "InstallerSandboxes", "Internet Plug-Ins", "Java", "KernelCollections", "Keyboard Layouts", "Keychains", "LaunchAgents",
+        "LaunchDaemons", "Logs", "Mail", "Managed Preferences", "Messages", "Modem Scripts", "OSAnalytics", "OpenDirectory",
+        "PDF Services", "Perl", "Plug-Ins", "PreferencePanes", "Preferences", "Printers", "PrivilegedHelperTools", "QuickLook",
+        "Receipts", "Ringtones", "Ruby", "Sandbox", "Screen Savers", "ScriptingAdditions", "Scripts", "Security", "Services",
+        "Sounds", "Speech", "Spelling", "Spotlight", "StagedDriverExtensions", "StagedExtensions", "StartupItems",
+        "SystemExtensions", "SystemMigration", "SystemProfiler", "Trial", "Updates", "User Pictures", "User Template", "Video",
+        "WebServer", "Widgets",
+    ]
     private static let reviewAreas = ["/Library/Application Support/", "/Library/Audio/", "/Library/Frameworks/", "/Library/Java/", "/usr/local/"]
     private static let neverInLibrary = [
         "/Library/Preferences", "/Library/LaunchDaemons", "/Library/LaunchAgents", "/Library/Extensions", "/Library/Keychains",
@@ -182,7 +195,8 @@ public enum AdviceGuard {
                 return nil
             }
             if reviewAreas.contains(where: { path.hasPrefix($0) && path.dropFirst($0.count).contains(where: { $0 != "/" }) }) { return nil }
-            if path.hasPrefix("/Library/"), path.split(separator: "/").count >= 3 { return nil }
+            let parts = path.split(separator: "/")
+            if path.hasPrefix("/Library/"), parts.count >= 3 || !standardInLibrary.contains(String(parts[1])) { return nil }
             return "is outside the areas that can be suggested"
         }
         return "outside the home folder only caches, logs and temporary files can be marked safe or regenerable; use review for software"
@@ -233,17 +247,20 @@ public enum AdviceActions {
             },
             estimate: { argument in
                 guard let argument, let brew else { return 0 }
-                var total = folderSize(URL(filePath: "/opt/homebrew/Caskroom/" + argument))
+                let caskroom = "/opt/homebrew/Caskroom/" + argument
+                var paths = [caskroom]
                 if let data = run(brew, ["info", "--cask", "--json=v2", argument]).output.data(using: .utf8),
                    let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                    let casks = json["casks"] as? [[String: Any]], let artifacts = casks.first?["artifacts"] as? [[String: Any]] {
                     for artifact in artifacts {
-                        for app in artifact["app"] as? [Any] ?? [] {
-                            if let name = app as? String { total += folderSize(URL(filePath: "/Applications/" + name)) }
+                        paths += (artifact["app"] as? [Any] ?? []).compactMap { $0 as? String }.map { "/Applications/" + $0 }
+                        for step in artifact["uninstall"] as? [[String: Any]] ?? [] {
+                            paths += step["delete"] as? [String] ?? (step["delete"] as? String).map { [$0] } ?? []
                         }
                     }
                 }
-                return total
+                let distinct = Set(paths).filter { path in path == caskroom || !path.hasPrefix(caskroom + "/") }
+                return distinct.reduce(0) { $0 + folderSize(URL(filePath: $1)) }
             }),
         AdviceActionDefinition(
             id: "simctl-delete-unavailable", needsArgument: false,
@@ -386,12 +403,13 @@ public enum AdviceActions {
     public static func folderSize(_ url: URL) -> Int64 {
         var info = stat()
         guard lstat(url.path, &info) == 0 else { return 0 }
-        guard info.st_mode & S_IFMT == S_IFDIR else { return Int64(info.st_blocks) * 512 }
-        let keys: [URLResourceKey] = [.totalFileAllocatedSizeKey]
-        guard let walk = FileManager.default.enumerator(at: url, includingPropertiesForKeys: keys, options: [], errorHandler: { _, _ in true }) else { return 0 }
-        var total: Int64 = 0
-        for case let item as URL in walk {
-            total += Int64((try? item.resourceValues(forKeys: Set(keys)).totalFileAllocatedSize) ?? 0)
+        var total = Int64(info.st_blocks) * 512
+        guard info.st_mode & S_IFMT == S_IFDIR, let walk = FileManager.default.enumerator(atPath: url.path) else { return total }
+        var linked = Set<UInt64>()
+        while let relative = walk.nextObject() as? String {
+            guard lstat(url.path + "/" + relative, &info) == 0 else { continue }
+            if info.st_nlink > 1, info.st_mode & S_IFMT != S_IFDIR, !linked.insert(info.st_ino).inserted { continue }
+            total += Int64(info.st_blocks) * 512
         }
         return total
     }
