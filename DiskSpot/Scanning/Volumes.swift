@@ -34,7 +34,10 @@ enum Volumes {
 
     static func list() -> [VolumeEntry] {
         let keys: [URLResourceKey] = [.volumeLocalizedNameKey, .volumeIsLocalKey, .volumeIsRootFileSystemKey, .volumeIsBrowsableKey]
-        let urls = FileManager.default.mountedVolumeURLs(includingResourceValuesForKeys: keys, options: [.skipHiddenVolumes]) ?? []
+        var urls = FileManager.default.mountedVolumeURLs(includingResourceValuesForKeys: keys, options: [.skipHiddenVolumes]) ?? []
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["DISKSPOT_DEMO"] != nil { urls = urls.filter { $0.path == "/" } }
+        #endif
         return urls.compactMap { url in
             let values = try? url.resourceValues(forKeys: Set(keys))
             guard values?.volumeIsLocal ?? false, values?.volumeIsBrowsable ?? true else { return nil }
@@ -130,6 +133,9 @@ enum Volumes {
 
 enum Permissions {
     static func hasFullDiskAccess() -> Bool {
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["DISKSPOT_DEMO"] != nil { return true }
+        #endif
         let descriptor = open("/Library/Application Support/com.apple.TCC/TCC.db", O_RDONLY)
         guard descriptor >= 0 else { return false }
         close(descriptor)
