@@ -1,0 +1,42 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Toolchain
+        run: xcodebuild -version && swift --version && brew install xcodegen
+
+      - name: Build
+        run: ./build.sh Release && ./build-mcp.sh
+
+      - name: Package
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          [[ $GITHUB_REF == refs/tags/* ]] || version=$(git rev-parse --short HEAD)
+          ditto -c -k --keepParent build/DiskSpot.app "DiskSpot-$version.zip"
+          ditto -c -k --keepParent build/diskspotmcp "diskspotmcp-$version-arm64.zip"
+          shasum -a 256 *.zip | tee SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: diskspot
+          path: |
+            *.zip
+            SHA256SUMS.txt
+
+      - name: Publish
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" *.zip SHA256SUMS.txt --title "DiskSpot $GITHUB_REF_NAME" --generate-notes
