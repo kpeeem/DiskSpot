@@ -1,82 +1,54 @@
 # DiskSpot
 
-Анализатор места на диске для macOS 15+: быстрая оценка по индексу Spotlight плюс точный обход того, чего Spotlight не видит. Карта занятого места, дерево с долями, типы файлов и инспектор. Тот же сканер доступен агентам через MCP-сервер `diskspotmcp`.
+[![Release](https://img.shields.io/github/v/release/kpeeem/DiskSpot)](https://github.com/kpeeem/DiskSpot/releases/latest)
+[![License](https://img.shields.io/github/license/kpeeem/DiskSpot)](LICENSE)
+![macOS 15+](https://img.shields.io/badge/macOS-15%2B-black)
 
-![DiskSpot: /Applications, 118,7 ГБ посчитано точно](Docs/diskspot.jpg)
+English · [Русский](README.ru.md)
 
-## Быстрый старт
+> **TL;DR** — A SwiftUI disk-space analyzer that answers in seconds from the Spotlight index and walks exactly only what Spotlight can't see. Treemap, tree with shares, file kinds, a cleanup tab, and an MCP server so Claude can measure your disk and send cleanup advice into the app. The interface is in Russian.
 
-```sh
-git clone git@github.com:kpeeem/DiskSpot.git
-```
+![DiskSpot: home folder treemap, tree and file kinds](Docs/diskspot.jpg)
 
-```sh
-cd DiskSpot && ./build.sh
-```
+## Install
 
-```sh
-open build/DiskSpot.app
-```
-
-Нужны Xcode и `xcodegen` (`brew install xcodegen`). `build.sh` подписывает приложение первым сертификатом из Связки ключей, поэтому «Полный доступ к диску» сохраняется между пересборками; без этого доступа часть `~/Library`, Рабочий стол, Документы и Загрузки скрыты и от Spotlight, и от обхода.
-
-MCP-сервер для Claude Code:
+1. Download `DiskSpot-*.zip` from [Releases](https://github.com/kpeeem/DiskSpot/releases/latest) and move the app to Applications.
+2. The build is not notarized. On first launch open **System Settings → Privacy & Security → Open Anyway**, or run:
 
 ```sh
-./build-mcp.sh
+xattr -dr com.apple.quarantine /Applications/DiskSpot.app
 ```
+
+3. Give it **Full Disk Access**: without it Desktop, Documents, Downloads and parts of Library are hidden from both Spotlight and the walk.
+
+Build from source (Xcode and `brew install xcodegen`):
 
 ```sh
-claude mcp add --scope user diskspot "$PWD/build/diskspotmcp"
+git clone https://github.com/kpeeem/DiskSpot.git && cd DiskSpot && ./build.sh && open build/DiskSpot.app
 ```
 
-## Уборка и советы Claude
+## What it does
 
-В инспекторе две вкладки: **Обзор** и **Уборка**. На «Уборке» — советы, которые Claude прислал через MCP (`disk_advise`): путь, размер, вердикт и объяснение, почему это безопасно, — и известные места, которые DiskSpot меряет сам: кэши программ, журналы, DerivedData, кэши uv/npm/Gradle/Cargo, устройства симулятора, модели. Безопасное отмечено заранее; в Корзину уходит только то, что вы подтвердите, и дерево сразу обновляется.
+- **Spotlight first.** Big files and bundles come from the index in seconds; blind spots are walked exactly.
+- **Exact when needed.** Parallel `getattrlistbulk` walk counts like `du`: the whole data volume, 9 million files, in about two minutes.
+- **Watch growth.** Snapshots and diffs show what grew since last time.
+- **Уборка (Clean Up).** Claude's advice plus caches, logs, DerivedData and package caches DiskSpot measures itself.
 
-![Вкладка «Уборка» с советами Claude](Docs/cleanup.jpg)
+![Cleanup tab with Claude's advice](Docs/cleanup.jpg)
 
-Сценарий: спрашиваете Claude «чем забит диск, что почистить» → он меряет (`disk_top`, `disk_recent`, `disk_diff`) и отправляет выводы `disk_advise` → DiskSpot открывается на «Уборке» → вы выбираете и подтверждаете → `disk_advice` показывает агенту, что перемещено и что оставлено. Советы общие с Disk Inventory (`~/Library/Application Support/DiskAdvice`). Целые `~/Library`, `~/Documents`, `~/Dev` отклоняются для любого вердикта, кроме «оставить».
-
-Вне домашней папки `disk_system` меряет системные кэши и журналы, временные папки, симуляторы, Homebrew, Docker и программы, которые давно не запускали. Агент присылает либо путь (кэши и временные файлы — с любым вердиктом, программы и папки производителей в `/Library` — только «стоит посмотреть», `/System`, `/usr`, `/opt/homebrew` и системная настройка отклоняются), либо действие из закрытого списка: `brew-cleanup`, `brew-uninstall-cask`, `simctl-delete-unavailable`, `simctl-delete-device`, `simctl-runtime-delete`, `docker-prune`, `empty-trash`. У действия в строке кнопка «Выполнить…», перед запуском видна точная команда. Файлы, которые принадлежат системе, переносит в Корзину Finder и сам спрашивает пароль администратора.
-
-## Как считается
-
-1. **Spotlight.** Запрос `kMDItemPhysicalSize` по индексу возвращает крупные файлы и пакеты за секунды, размеры папок собираются по путям.
-2. **Слепые зоны.** Места, которые Spotlight не индексирует (исключения, системные и служебные папки), обходятся точно.
-3. **Точный обход.** Общая очередь папок: свободные потоки забирают поддеревья, до которых занятые ещё не дошли, поэтому том с одной огромной домашней папкой не упирается в один поток. Записи читаются пакетами через `getattrlistbulk` (если папка отказывает — через `readdir`), блоки считаются как у `du`, hard links один раз, точки монтирования не пересекаются, выгруженные в iCloud файлы и папки не скачиваются. Во время обхода хранятся только папки и файлы крупнее порога, свёрнутое дерево строится снизу вверх.
-
-| Что сканировалось (под нагрузкой) | Файлов | Прежний обход | Очередь папок |
-|---|---:|---:|---:|
-| `/Applications/Xcode.app/Contents/Developer` | 126 457 | 1,0–1,8 с | 0,4–0,8 с |
-| `~/Dev` | 3,5 млн | 34,5 с | 28,7 с |
-| `/System/Volumes/Data` целиком | 9,2 млн | 232 с | 137 с |
-
-На неизменных деревьях итоги и свёрнутое дерево совпадают с прежним сканером до байта.
-
-## MCP
-
-| Инструмент | Что делает |
-|---|---|
-| `disk_volumes`, `disk_status` | тома, занято, свободно, purgeable; системные APFS-тома; доступ и исключения Spotlight |
-| `disk_tree`, `disk_top` | точное дерево и самые тяжёлые папки и файлы под путём |
-| `disk_big_files`, `disk_recent` | крупные файлы и то, что записано за последние дни, прямо из индекса Spotlight |
-| `disk_snapshot`, `disk_diff`, `disk_snapshot_forget` | сохранить замер и посмотреть, что выросло, появилось или пропало с тех пор |
-| `disk_advise`, `disk_advice`, `disk_advice_clear`, `disk_show_cleanup` | отправить советы во вкладку «Уборка», прочитать решения пользователя, убрать советы, открыть вкладку |
-| `disk_system` | что занимает место вне домашней папки, давно не запускавшиеся программы, список разрешённых действий |
-
-Весь загрузочный том — это `/System/Volumes/Data`: `/` — запечатанный системный том, а обход не пересекает точки монтирования.
-
-## Отладка
-
-Отладочная сборка фотографирует собственное окно и пишет журнал скана:
+## Ask Claude what to clean
 
 ```sh
-./build.sh Debug
+./build-mcp.sh && claude mcp add --scope user diskspot "$PWD/build/diskspotmcp"
 ```
 
-```sh
-open -n --env DISKSPOT_FOLDER=/Applications --env DISKSPOT_SNAPSHOT=/tmp/diskspot --env DISKSPOT_NO_SHEET=1 --stderr /tmp/diskspot.log build/DiskSpot-Debug.app
-```
+Then ask *“what filled my disk lately, what can I delete?”*. Claude answers from `disk_recent`, `disk_top` and `disk_system` and sends each finding with a verdict and a reason; you tick what goes, Claude reads back what you did. The advice is shared with [Disk Inventory](https://github.com/kpeeem/DiskInventory).
 
-`DISKSPOT_FOLDER` сразу открывает папку, `DISKSPOT_EXACT`, `DISKSPOT_ZOOM`, `DISKSPOT_SELECT` и `DISKSPOT_PROBE` запускают точный обход, приближение, выделение и проверку сканера.
+> [!IMPORTANT]
+> The agent never deletes anything. Paths go to the Trash only after you confirm. Commands come from a fixed allowlist (`brew cleanup`, `simctl delete`, `docker prune`…), and the app shows the exact command before running it. `/System`, `/usr` and system settings are refused.
+
+More: [how it counts, MCP tools, benchmarks, debugging](Docs/details.md)
+
+## License
+
+[MIT](LICENSE)
