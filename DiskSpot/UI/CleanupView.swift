@@ -77,7 +77,7 @@ struct CleanupView: View {
                 if !advice.summary.isEmpty {
                     Text(advice.summary).foregroundStyle(.secondary)
                 }
-                ForEach(advice.items) { item in
+                ForEach(advice.items.filter { $0.status == .pending } + advice.items.filter { $0.status != .pending }) { item in
                     AdviceRow(item: item) { confirmRun = $0 }
                 }
             } header: {
