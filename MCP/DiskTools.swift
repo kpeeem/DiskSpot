@@ -60,6 +60,11 @@ func adviceJSON(_ sheet: AdviceSheet?) -> [String: Any] {
                 "reason": item.reason,
                 "status": item.status.rawValue,
                 "status_at": item.statusAt as Any,
+                "title": item.title,
+                "action": item.action as Any,
+                "argument": item.argument as Any,
+                "command": item.action.flatMap { AdviceActions.definition($0)?.commandLine(item.argument) } as Any,
+                "output": item.output.map { String($0.suffix(2000)) } as Any,
             ] as [String: Any]
         },
     ]
@@ -355,7 +360,7 @@ func makeDiskTools(_ store: ScanStore) -> [Tool] {
 
         syncTool(
             "disk_advise",
-            "Send your cleanup analysis to the DiskSpot app: each item appears on the Уборка tab of the inspector with its size, your verdict and your reason, and the user decides there. Nothing is deleted by this tool. Paths outside the home folder and known cache areas, and whole top-level folders such as ~/Library or ~/Documents, are refused for any verdict except keep. Opens the app on that tab unless show is false. Disk Inventory reads the same advice.",
+            "Send your cleanup analysis to the DiskSpot app: each item appears on the Уборка tab of the inspector with its size, your verdict and your reason, and the user decides there. Nothing is deleted or run by this tool. An item is either a path, which the user can move to the Trash, or an action from the allowlist in disk_system (Homebrew cleanup, simulator and runtime deletion, Docker prune, emptying the Trash), which the user can run with one click after seeing the exact command. Whole top-level folders such as ~/Library or ~/Documents are refused; outside the home folder caches, logs and temporary files (/Library/Caches, /Library/Logs, /private/tmp, /private/var/folders of this user, /Users/Shared) take any verdict, apps in /Applications and vendor folders in /Library only review, and /System, /usr, /opt/homebrew and system configuration are refused. Opens the app on that tab unless show is false. Disk Inventory reads the same advice.",
             Schema.object([
                 "title": Schema.text("heading shown above your advice, e.g. what the user asked"),
                 "summary": Schema.text("two or three sentences: what fills the disk and what is safe to remove"),
@@ -365,11 +370,14 @@ func makeDiskTools(_ store: ScanStore) -> [Tool] {
                     "items": [
                         "type": "object",
                         "properties": [
-                            "path": Schema.text("absolute path or ~/…"),
+                            "path": Schema.text("absolute path or ~/…; for an action, optionally the folder it frees space in"),
+                            "action": Schema.choice("instead of a path: an allowlisted command the user can run from the app", AdviceActions.all.map(\.id)),
+                            "argument": Schema.text("the action's argument: cask name, simulator UDID or runtime identifier"),
+                            "title": Schema.text("short name shown in bold, in the user's language; defaults to the file name or the action's English title"),
                             "verdict": Schema.choice(verdictDescription, AdviceVerdict.allCases.map(\.rawValue)),
                             "reason": Schema.text("why, in the user's language: what it is, what happens after removal, how to get it back"),
                         ],
-                        "required": ["path", "verdict", "reason"],
+                        "required": ["verdict", "reason"],
                         "additionalProperties": false,
                     ],
                 ],
@@ -382,9 +390,26 @@ func makeDiskTools(_ store: ScanStore) -> [Tool] {
             var accepted: [AdviceItem] = []
             var refused: [[String: Any]] = []
             for entry in raw {
-                guard let given = entry["path"] as? String,
-                      let verdict = (entry["verdict"] as? String).flatMap(AdviceVerdict.init(rawValue:)) else {
-                    refused.append(["item": String(describing: entry), "why": "path and a valid verdict are required"])
+                guard let verdict = (entry["verdict"] as? String).flatMap(AdviceVerdict.init(rawValue:)) else {
+                    refused.append(["item": String(describing: entry), "why": "a valid verdict is required"])
+                    continue
+                }
+                if let action = entry["action"] as? String {
+                    let argument = entry["argument"] as? String
+                    if let refusal = AdviceActions.refusal(action, argument: argument) {
+                        refused.append(["action": action, "why": refusal])
+                        continue
+                    }
+                    let path = (entry["path"] as? String).map(AdviceGuard.normalize) ?? ""
+                    var item = AdviceItem(path: path, size: AdviceActions.estimate(action, argument: argument), verdict: verdict,
+                                          reason: (entry["reason"] as? String) ?? "", action: action, argument: argument,
+                                          label: entry["title"] as? String)
+                    if item.size == 0, !path.isEmpty { item.size = adviceSize(path, store: store) }
+                    accepted.append(item)
+                    continue
+                }
+                guard let given = entry["path"] as? String else {
+                    refused.append(["item": String(describing: entry), "why": "a path or an action is required"])
                     continue
                 }
                 let path = AdviceGuard.normalize(given)
@@ -393,13 +418,13 @@ func makeDiskTools(_ store: ScanStore) -> [Tool] {
                     continue
                 }
                 accepted.append(AdviceItem(path: path, size: adviceSize(path, store: store), verdict: verdict,
-                                           reason: (entry["reason"] as? String) ?? ""))
+                                           reason: (entry["reason"] as? String) ?? "", label: entry["title"] as? String))
             }
             let append = try params.flag("append", fallback: false)
             let sheet = try AdviceStore.update { sheet in
                 var items = append ? sheet?.items ?? [] : []
-                let known = Set(items.map(\.path))
-                items += accepted.filter { !known.contains($0.path) }
+                let known = Set(items.map(\.key))
+                items += accepted.filter { !known.contains($0.key) }
                 sheet = AdviceSheet(
                     title: params.string("title") ?? sheet?.title ?? "Что можно почистить",
                     summary: params.string("summary") ?? (append ? sheet?.summary ?? "" : ""),
@@ -417,12 +442,12 @@ func makeDiskTools(_ store: ScanStore) -> [Tool] {
 
         syncTool(
             "disk_advice",
-            "The advice currently shown in the apps and what the user did with each item: pending, trashed, kept or missing (gone from disk).",
+            "The advice currently shown in the apps and what the user did with each item: pending, trashed, kept, missing (gone from disk), done or failed (an action the user ran, with its output).",
             Schema.object([:])
         ) { _ in
             let sheet = try AdviceStore.update { sheet in
                 guard var current = sheet else { return }
-                for index in current.items.indices where current.items[index].status == .pending
+                for index in current.items.indices where current.items[index].isRemovable
                     && !FileManager.default.fileExists(atPath: current.items[index].path) {
                     current.items[index].status = .missing
                     current.items[index].statusAt = Date()
@@ -447,6 +472,14 @@ func makeDiskTools(_ store: ScanStore) -> [Tool] {
                 sheet = current.items.isEmpty ? nil : current
             }
             return adviceJSON(sheet)
+        },
+
+        syncTool(
+            "disk_system",
+            "What takes space outside the home folder, measured exactly: /Library/Caches, /Library/Logs, simulator caches, this user's temporary and cache folders in /private/var/folders, /private/tmp, /Users/Shared, the Trash, simulator runtimes and simulators with the ones that use each runtime, Homebrew (cleanup estimate, biggest casks), Docker, local Time Machine snapshots, and the 60 biggest apps with the days since each was last launched. Also lists the actions disk_advise accepts. Read-only; takes a minute or two.",
+            Schema.object([:])
+        ) { _ in
+            SystemSurvey.report { adviceSize($0, store: store) }
         },
 
         syncTool(

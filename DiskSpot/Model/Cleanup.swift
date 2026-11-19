@@ -102,7 +102,7 @@ final class CleanupStore {
     var adviceSelected: Set<UUID> = []
     var placeSelected: Set<String> = []
 
-    var pendingAdvice: [AdviceItem] { advice?.items.filter { $0.status == .pending && $0.verdict != .keep } ?? [] }
+    var pendingAdvice: [AdviceItem] { advice?.items.filter(\.isRemovable) ?? [] }
     var chosenAdvice: [AdviceItem] { pendingAdvice.filter { adviceSelected.contains($0.id) } }
     var chosenPlaces: [PlaceItem] {
         let advised = Set(chosenAdvice.map(\.path))

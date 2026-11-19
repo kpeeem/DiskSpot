@@ -4,6 +4,7 @@ struct CleanupView: View {
     @Environment(AppModel.self) private var model
     @State private var confirm = false
     @State private var showFailures = false
+    @State private var confirmRun: AdviceItem?
 
     var body: some View {
         @Bindable var store = model.cleanup
@@ -46,6 +47,16 @@ struct CleanupView: View {
         } message: {
             Text("Освободится \(Format.bytes(store.chosenSize)) после очистки Корзины. Из Корзины всё можно вернуть.")
         }
+        .confirmationDialog(confirmRun?.title ?? "", isPresented: Binding { confirmRun != nil } set: { if !$0 { confirmRun = nil } },
+                            presenting: confirmRun) { item in
+            Button(item.action == "empty-trash" ? "Очистить Корзину" : "Выполнить", role: .destructive) {
+                Task { await model.runCleanupAction(item) }
+            }
+        } message: { item in
+            let command = item.action.flatMap { AdviceActions.definition($0)?.commandLine(item.argument) }
+            Text([item.action == "empty-trash" ? "Всё из Корзины удалится навсегда, вернуть будет нельзя." : command,
+                  item.size > 0 ? "Освободится около \(Format.bytes(item.size))." : nil].compactMap { $0 }.joined(separator: "\n\n"))
+        }
         .sheet(isPresented: $showFailures) {
             VStack(alignment: .leading, spacing: 12) {
                 Text("Не удалось переместить: \(store.failures.count)").font(.headline)
@@ -67,7 +78,7 @@ struct CleanupView: View {
                     Text(advice.summary).foregroundStyle(.secondary)
                 }
                 ForEach(advice.items) { item in
-                    AdviceRow(item: item)
+                    AdviceRow(item: item) { confirmRun = $0 }
                 }
             } header: {
                 VStack(alignment: .leading, spacing: 2) {
@@ -128,6 +139,12 @@ private struct ItemActions: View {
 private struct AdviceRow: View {
     @Environment(AppModel.self) private var model
     let item: AdviceItem
+    let run: (AdviceItem) -> Void
+
+    private var location: String {
+        if item.path.isEmpty { return item.action.flatMap { AdviceActions.definition($0)?.commandLine(item.argument) } ?? "" }
+        return Format.path(item.isAction ? item.path : (item.path as NSString).deletingLastPathComponent)
+    }
 
     private var verdict: (String, String) {
         switch item.verdict {
@@ -141,7 +158,11 @@ private struct AdviceRow: View {
     var body: some View {
         @Bindable var store = model.cleanup
         HStack(alignment: .firstTextBaseline, spacing: 8) {
-            if item.status == .pending && item.verdict != .keep {
+            if item.isAction {
+                Image(systemName: item.status == .done ? "checkmark" : item.status == .failed ? "exclamationmark.triangle" : "terminal")
+                    .foregroundStyle(.secondary)
+                    .frame(width: 14)
+            } else if item.status == .pending && item.verdict != .keep {
                 Toggle(Format.path(item.path), isOn: Binding {
                     store.adviceSelected.contains(item.id)
                 } set: { on in
@@ -153,11 +174,11 @@ private struct AdviceRow: View {
                 Image(systemName: item.verdict == .keep ? "lock" : "checkmark").foregroundStyle(.secondary).frame(width: 14)
             }
             VStack(alignment: .leading, spacing: 3) {
-                Text((item.path as NSString).lastPathComponent)
-                    .strikethrough(item.status == .trashed || item.status == .missing)
+                Text(item.title)
+                    .strikethrough(item.status == .trashed || item.status == .missing || item.status == .done)
                     .lineLimit(1)
                     .truncationMode(.middle)
-                Text(Format.path((item.path as NSString).deletingLastPathComponent))
+                Text(location)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -170,16 +191,29 @@ private struct AdviceRow: View {
                 case .trashed: Text("Перемещено в Корзину").font(.caption).foregroundStyle(.tertiary)
                 case .kept: Text("Вы решили оставить").font(.caption).foregroundStyle(.tertiary)
                 case .missing: Text("Уже нет на диске").font(.caption).foregroundStyle(.tertiary)
-                case .pending: EmptyView()
+                case .done: Text("Выполнено").font(.caption).foregroundStyle(.tertiary)
+                case .failed:
+                    Text(item.output.map { String($0.suffix(600)) } ?? "Не получилось")
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(8)
+                        .textSelection(.enabled)
+                case .pending:
+                    if item.isRunnable {
+                        Button(item.action == "empty-trash" ? "Очистить Корзину…" : "Выполнить…") { run(item) }
+                            .controlSize(.small)
+                            .disabled(model.cleanup.working != nil)
+                            .padding(.top, 2)
+                    }
                 }
             }
             Spacer(minLength: 4)
             Text(Format.bytes(item.size)).monospacedDigit().foregroundStyle(.secondary)
         }
         .contentShape(Rectangle())
-        .onTapGesture { model.revealPath(item.path) }
+        .onTapGesture { if !item.path.isEmpty { model.revealPath(item.path) } }
         .contextMenu {
-            ItemActions(path: item.path)
+            if !item.path.isEmpty { ItemActions(path: item.path) }
             if item.status == .pending, item.verdict != .keep {
                 Divider()
                 Button("Оставить") { model.cleanup.keep(item) }

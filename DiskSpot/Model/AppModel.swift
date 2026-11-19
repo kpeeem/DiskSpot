@@ -126,22 +126,27 @@ final class AppModel {
         let advised = cleanup.chosenAdvice
         let paths = advised.map(\.path) + cleanup.chosenPlaces.map(\.path)
         cleanup.working = "Перемещаю в Корзину: \(paths.count)"
-        var done: Set<String> = []
-        var errors: [String] = []
-        for path in paths {
-            do {
-                var resulting: NSURL?
-                try FileManager.default.trashItem(at: URL(fileURLWithPath: path), resultingItemURL: &resulting)
-                done.insert(path)
-                if let root, let node = root.descendant(at: path, create: false), canTrash(node) {
-                    moveToTrash(node, trashedPath: (resulting as URL?)?.path)
-                }
-            } catch {
-                errors.append("\(Format.path(path)): \(error.localizedDescription)")
+        let urls = paths.map { URL(fileURLWithPath: $0) }
+        let outcome = await Task.detached(priority: .userInitiated) { AdviceTrash.move(urls) }.value
+        let done = Set(outcome.done.map(\.path))
+        for path in done {
+            if let root, let node = root.descendant(at: path, create: false), canTrash(node) {
+                moveToTrash(node, trashedPath: nil)
             }
         }
         try? AdviceStore.mark(Set(advised.filter { done.contains($0.path) }.map(\.id)), as: .trashed)
-        cleanup.failures = errors
+        cleanup.failures = outcome.errors
+        cleanup.working = nil
+        cleanup.reloadAdvice()
+        await cleanup.measure()
+    }
+
+    func runCleanupAction(_ item: AdviceItem) async {
+        guard let action = item.action else { return }
+        cleanup.working = "Выполняю: \(item.title)"
+        let argument = item.argument
+        let result = await Task.detached(priority: .userInitiated) { AdviceActions.perform(action, argument: argument) }.value
+        try? AdviceStore.mark([item.id], as: result.ok ? .done : .failed, output: result.output)
         cleanup.working = nil
         cleanup.reloadAdvice()
         await cleanup.measure()

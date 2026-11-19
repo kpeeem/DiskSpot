@@ -42,6 +42,12 @@ disk_advise with every candidate, a verdict and a reason in the user's language.
 The DiskSpot app shows it on its cleanup tab and the user removes what they \
 agree with; disk_advice reports what was trashed or kept. Never delete files \
 yourself.
+
+Outside the home folder: disk_system measures system caches, logs, temporary \
+folders, simulators, Homebrew, Docker and apps not launched for months. Advise \
+paths there, or allowlisted actions (brew-cleanup, brew-uninstall-cask, \
+simctl-delete-unavailable, simctl-delete-device, simctl-runtime-delete, \
+docker-prune, empty-trash) that the user runs from the app after seeing the command.
 """
 
 let arguments = Array(CommandLine.arguments.dropFirst())
