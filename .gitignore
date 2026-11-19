@@ -1,0 +1,4 @@
+build/
+.build/
+DiskSpot.xcodeproj/
+.DS_Store
