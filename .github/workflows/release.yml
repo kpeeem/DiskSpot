@@ -25,7 +25,7 @@ jobs:
           version=${GITHUB_REF_NAME#v}
           [[ $GITHUB_REF == refs/tags/* ]] || version=$(git rev-parse --short HEAD)
           ditto -c -k --keepParent build/DiskSpot.app "DiskSpot-$version.zip"
-          ditto -c -k --keepParent build/diskspotmcp "diskspotmcp-$version-arm64.zip"
+          ditto -c -k build/diskspotmcp "diskspotmcp-$version-arm64.zip"
           shasum -a 256 *.zip | tee SHA256SUMS.txt
 
       - uses: actions/upload-artifact@v4
