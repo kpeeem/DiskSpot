@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 
 final class ScanContext: @unchecked Sendable {
     private struct LinkKey: Hashable {
@@ -29,14 +30,11 @@ final class ScanContext: @unchecked Sendable {
         lock.withLock { (files, bytes, unreadable) }
     }
 
-    /// Hard-linked files are counted once, like `du` does.
     func firstSighting(device: Int32, inode: UInt64) -> Bool {
         lock.withLock { seenLinks.insert(LinkKey(device: device, inode: inode)).inserted }
     }
 }
 
-/// Folder totals collected during a walk. Small files and small folders are folded into one
-/// aggregate so that scanning millions of cache files keeps the tree compact.
 private struct Accumulator {
     var name: String
     var kept: [Node] = []
@@ -91,36 +89,237 @@ private struct Accumulator {
     }
 }
 
+private struct DirectoryEntry {
+    let name: String
+    let isDirectory: Bool
+    let isRegular: Bool
+    let device: Int32
+    let inode: UInt64
+    let links: UInt32
+    let allocated: Int64
+    let isDataless: Bool
+    let isMountPoint: Bool
+
+    init(name: String, info: stat) {
+        self.name = name
+        let type = info.st_mode & S_IFMT
+        isDirectory = type == S_IFDIR
+        isRegular = type == S_IFREG
+        device = info.st_dev
+        inode = info.st_ino
+        links = UInt32(info.st_nlink)
+        allocated = isDirectory ? 0 : Int64(info.st_blocks) * 512
+        isDataless = info.st_flags & UInt32(SF_DATALESS) != 0
+        isMountPoint = false
+    }
+
+    init(name: String, type: UInt32, device: Int32, inode: UInt64, flags: UInt32, links: UInt32, allocated: Int64, mountStatus: UInt32) {
+        self.name = name
+        isDirectory = type == VDIR.rawValue
+        isRegular = type == VREG.rawValue
+        self.device = device
+        self.inode = inode
+        self.links = links
+        self.allocated = max(0, allocated)
+        isDataless = flags & UInt32(SF_DATALESS) != 0
+        isMountPoint = mountStatus & UInt32(DIR_MNTSTATUS_MNTPOINT) != 0
+    }
+}
+
+private enum BulkDirectory {
+    static let bufferSize = 128 * 1024
+    static let openFlags = O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW
+    private static let common = UInt32(ATTR_CMN_NAME | ATTR_CMN_DEVID | ATTR_CMN_OBJTYPE | ATTR_CMN_FLAGS | ATTR_CMN_FILEID)
+    private static let file = UInt32(ATTR_FILE_LINKCOUNT | ATTR_FILE_ALLOCSIZE)
+
+    private static let attributes: attrlist = {
+        var list = attrlist()
+        list.bitmapcount = UInt16(ATTR_BIT_MAP_COUNT)
+        list.commonattr = common | UInt32(ATTR_CMN_ERROR) | ATTR_CMN_RETURNED_ATTRS
+        list.dirattr = UInt32(ATTR_DIR_MOUNTSTATUS)
+        list.fileattr = file
+        return list
+    }()
+
+    static let raisedDescriptorLimit: Void = {
+        var limit = rlimit()
+        guard getrlimit(RLIMIT_NOFILE, &limit) == 0 else { return }
+        let wanted = min(limit.rlim_max, rlim_t(OPEN_MAX))
+        if limit.rlim_cur < wanted {
+            limit.rlim_cur = wanted
+            setrlimit(RLIMIT_NOFILE, &limit)
+        }
+    }()
+
+    private struct Cursor {
+        let bytes: UnsafeRawBufferPointer
+        var offset: Int
+
+        mutating func take<T>(_ type: T.Type) -> T? {
+            guard offset + MemoryLayout<T>.size <= bytes.count else { return nil }
+            let value = bytes.loadUnaligned(fromByteOffset: offset, as: type)
+            offset += MemoryLayout<T>.size
+            return value
+        }
+    }
+
+    static func read(_ descriptor: Int32, buffer: UnsafeMutableRawBufferPointer, _ body: (DirectoryEntry) -> Void) -> Bool {
+        var request = attributes
+        while true {
+            let count = getattrlistbulk(descriptor, &request, buffer.baseAddress, buffer.count, UInt64(FSOPT_RETURN_REALDEV))
+            if count == 0 { return true }
+            if count < 0 { return false }
+            var position = 0
+            for _ in 0..<count {
+                guard position + MemoryLayout<UInt32>.size <= buffer.count else { return true }
+                let length = Int(buffer.loadUnaligned(fromByteOffset: position, as: UInt32.self))
+                guard length >= 24, position + length <= buffer.count else { return true }
+                let record = UnsafeRawBufferPointer(rebasing: buffer[position..<(position + length)])
+                position += length
+                if let entry = decode(record, descriptor: descriptor) { body(entry) }
+            }
+        }
+    }
+
+    private static func decode(_ record: UnsafeRawBufferPointer, descriptor: Int32) -> DirectoryEntry? {
+        var cursor = Cursor(bytes: record, offset: MemoryLayout<UInt32>.size)
+        guard let returned = cursor.take(attribute_set_t.self) else { return nil }
+        let error = returned.commonattr & UInt32(ATTR_CMN_ERROR) != 0 ? cursor.take(UInt32.self) ?? 1 : 0
+        guard returned.commonattr & UInt32(ATTR_CMN_NAME) != 0 else { return nil }
+        let referenceOffset = cursor.offset
+        guard let reference = cursor.take(attrreference_t.self) else { return nil }
+        let start = referenceOffset + Int(reference.attr_dataoffset)
+        let nameLength = Int(reference.attr_length)
+        guard nameLength > 0, start >= cursor.offset, start + nameLength <= record.count, record[start + nameLength - 1] == 0 else { return nil }
+        let name = String(decoding: UnsafeRawBufferPointer(rebasing: record[start..<(start + nameLength - 1)]), as: UTF8.self)
+        let device = returned.commonattr & UInt32(ATTR_CMN_DEVID) != 0 ? cursor.take(Int32.self) ?? -1 : -1
+        let type = returned.commonattr & UInt32(ATTR_CMN_OBJTYPE) != 0 ? cursor.take(UInt32.self) ?? 0 : 0
+        let flags = returned.commonattr & UInt32(ATTR_CMN_FLAGS) != 0 ? cursor.take(UInt32.self) ?? 0 : 0
+        let inode = returned.commonattr & UInt32(ATTR_CMN_FILEID) != 0 ? cursor.take(UInt64.self) ?? 0 : 0
+        let mountStatus = returned.dirattr & UInt32(ATTR_DIR_MOUNTSTATUS) != 0 ? cursor.take(UInt32.self) ?? 0 : 0
+
+        let complete = error == 0 && returned.commonattr & common == common && device != -1 && flags & UInt32(SF_FIRMLINK) == 0
+        if complete, type == VDIR.rawValue, returned.dirattr & UInt32(ATTR_DIR_MOUNTSTATUS) != 0 {
+            return DirectoryEntry(name: name, type: type, device: device, inode: inode, flags: flags, links: 0, allocated: 0, mountStatus: mountStatus)
+        }
+        if complete, type == VREG.rawValue, returned.fileattr & file == file,
+           let links = cursor.take(UInt32.self), let allocated = cursor.take(Int64.self) {
+            return DirectoryEntry(name: name, type: type, device: device, inode: inode, flags: flags, links: links, allocated: allocated, mountStatus: 0)
+        }
+        var info = stat()
+        guard fstatat(descriptor, name, &info, AT_SYMLINK_NOFOLLOW) == 0 else { return nil }
+        return DirectoryEntry(name: name, info: info)
+    }
+}
+
+private struct Folder {
+    let name: String
+    var parent: Int32
+    var smallBytes: Int64 = 0
+    var smallCount = 0
+    var files: [(name: String, size: Int64)] = []
+}
+
+private struct Unit {
+    let path: String
+    let parentUnit: Int
+    let parentFolder: Int32
+}
+
+private final class WorkQueue: @unchecked Sendable {
+    private let condition = NSCondition()
+    private var units: [Unit]
+    private var results: [[Folder]?] = [nil]
+    private var pending = [0]
+    private var active = 0
+    private let backlog = Atomic<Int>(1)
+    let workers: Int
+
+    init(root: Unit, workers: Int) {
+        units = [root]
+        self.workers = workers
+    }
+
+    func unit(_ index: Int) -> Unit {
+        condition.withLock { units[index] }
+    }
+
+    func next(stopped: () -> Bool) -> Int? {
+        condition.lock()
+        defer { condition.unlock() }
+        while true {
+            if stopped() {
+                condition.broadcast()
+                return nil
+            }
+            if let index = pending.popLast() {
+                backlog.store(pending.count, ordering: .relaxed)
+                active += 1
+                return index
+            }
+            if active == 0 {
+                condition.broadcast()
+                return nil
+            }
+            condition.wait(until: Date(timeIntervalSinceNow: 0.05))
+        }
+    }
+
+    func offer(_ unit: Unit) -> Bool {
+        guard backlog.load(ordering: .relaxed) < workers else { return false }
+        condition.lock()
+        defer { condition.unlock() }
+        guard pending.count < workers else { return false }
+        units.append(unit)
+        results.append(nil)
+        pending.append(units.count - 1)
+        backlog.store(pending.count, ordering: .relaxed)
+        condition.signal()
+        return true
+    }
+
+    func finish(_ index: Int, folders: [Folder]) {
+        condition.lock()
+        defer { condition.unlock() }
+        results[index] = folders
+        active -= 1
+        if pending.isEmpty, active == 0 { condition.broadcast() }
+    }
+
+    func take() -> (units: [Unit], results: [[Folder]]) {
+        condition.withLock {
+            let finished = results.map { $0 ?? [] }
+            results = []
+            return (units, finished)
+        }
+    }
+}
+
 struct ExactScanner: Sendable {
     let context: ScanContext
     var fileThreshold: Int64 = 1_000_000
     var folderThreshold: Int64 = 1_000_000
-    /// Top levels are listed manually and walked in parallel; deeper levels go through fts.
-    var splitDepth = 2
 
-    /// Reading a dataless (evicted to iCloud) item would download it. With this policy such access
-    /// fails instead, so a scan never pulls anything from the cloud.
     static func disableDatalessMaterialization() {
         setiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_PROCESS, IOPOL_MATERIALIZE_DATALESS_FILES_OFF)
     }
 
     func scan(path: String) -> Node? {
+        BulkDirectory.raisedDescriptorLimit
         var info = stat()
         guard lstat(path, &info) == 0 else { return nil }
         let name = (path as NSString).lastPathComponent
-        guard isDirectory(info), !isDataless(info) else {
+        guard (info.st_mode & S_IFMT) == S_IFDIR, info.st_flags & UInt32(SF_DATALESS) == 0 else {
             let size = Int64(info.st_blocks) * 512
             context.add(files: 1, bytes: size)
             let node = Node(name: name, role: .file, kind: FileKind.classify(name: name), size: size, fileCount: 1)
             node.isExact = true
             return node
         }
-        guard var accumulator = scanDirectory(path: path, name: name, info: info, depth: splitDepth) else { return nil }
-        accumulator.name = name
-        return accumulator.makeNode()
+        guard let folders = collect(path: path, device: info.st_dev) else { return nil }
+        return build(folders, name: name)
     }
 
-    /// Several roots at once; results keep the order of `paths`.
     func scan(paths: [String]) -> [(path: String, node: Node)] {
         var results = [Node?](repeating: nil, count: paths.count)
         results.withUnsafeMutableBufferPointer { buffer in
@@ -131,166 +330,126 @@ struct ExactScanner: Sendable {
         return zip(paths, results).compactMap { path, node in node.map { (path, $0) } }
     }
 
-    private func isDirectory(_ info: stat) -> Bool {
-        (info.st_mode & S_IFMT) == S_IFDIR
-    }
-
-    private func isDataless(_ info: stat) -> Bool {
-        info.st_flags & UInt32(SF_DATALESS) != 0
-    }
-
-    private func allocatedSize(_ info: stat, isRegularFile: Bool) -> Int64 {
-        if isRegularFile, info.st_nlink > 1, !context.firstSighting(device: info.st_dev, inode: info.st_ino) {
+    private func allocatedSize(_ entry: DirectoryEntry) -> Int64 {
+        if entry.isRegular, entry.links > 1, !context.firstSighting(device: entry.device, inode: entry.inode) {
             return 0
         }
-        return Int64(info.st_blocks) * 512
+        return entry.allocated
     }
 
-    private func scanDirectory(path: String, name: String, info: stat, depth: Int) -> Accumulator? {
-        if context.isCancelled { return nil }
-        if depth <= 0 { return walk(path: path, name: name) }
-
-        let ownBytes = Int64(info.st_blocks) * 512
-        var accumulator = Accumulator(name: name, ownBytes: ownBytes)
-        guard let directory = opendir(path) else {
-            context.add(files: 0, bytes: ownBytes, unreadable: 1)
-            return accumulator
-        }
-        var subdirectories: [(path: String, name: String, info: stat)] = []
-        var files = 0
-        var bytes = ownBytes
-        while let entry = readdir(directory) {
-            let childName = withUnsafeBytes(of: &entry.pointee.d_name) { raw in
-                String(decoding: raw.prefix(Int(entry.pointee.d_namlen)), as: UTF8.self)
+    private func collect(path: String, device: Int32) -> [Folder]? {
+        let queue = WorkQueue(root: Unit(path: path, parentUnit: -1, parentFolder: -1),
+                              workers: max(2, ProcessInfo.processInfo.activeProcessorCount))
+        DispatchQueue.concurrentPerform(iterations: queue.workers) { _ in
+            let buffer = UnsafeMutableRawBufferPointer.allocate(byteCount: BulkDirectory.bufferSize, alignment: 8)
+            defer { buffer.deallocate() }
+            while let index = queue.next(stopped: { context.isCancelled }) {
+                queue.finish(index, folders: scanUnit(index, queue: queue, device: device, buffer: buffer))
             }
-            if childName == "." || childName == ".." { continue }
-            let childPath = path == "/" ? "/" + childName : path + "/" + childName
-            var childInfo = stat()
-            guard lstat(childPath, &childInfo) == 0 else { continue }
-            if isDirectory(childInfo) && isDataless(childInfo) {
-                let own = Int64(childInfo.st_blocks) * 512
-                accumulator.absorb(Accumulator(name: childName, ownBytes: own), threshold: folderThreshold)
-                bytes += own
-            } else if isDirectory(childInfo) {
-                // A different device means a mount point (another volume, a disk image…).
-                if childInfo.st_dev == info.st_dev {
-                    subdirectories.append((childPath, childName, childInfo))
-                }
+        }
+        if context.isCancelled { return nil }
+        var (units, results) = queue.take()
+        return merge(units, &results)
+    }
+
+    private func scanUnit(_ index: Int, queue: WorkQueue, device: Int32, buffer: UnsafeMutableRawBufferPointer) -> [Folder] {
+        let unit = queue.unit(index)
+        var folders = [Folder(name: (unit.path as NSString).lastPathComponent, parent: -1)]
+        let descriptor = open(unit.path, BulkDirectory.openFlags)
+        guard descriptor >= 0 else {
+            context.add(files: 0, bytes: 0, unreadable: 1)
+            return folders
+        }
+        walk(descriptor, folder: 0, path: unit.path, unit: index, device: device, folders: &folders, queue: queue, buffer: buffer)
+        close(descriptor)
+        return folders
+    }
+
+    private func walk(
+        _ descriptor: Int32, folder: Int, path: String, unit: Int, device: Int32,
+        folders: inout [Folder], queue: WorkQueue, buffer: UnsafeMutableRawBufferPointer
+    ) {
+        if context.isCancelled { return }
+        var subdirectories: [(name: String, index: Int)] = []
+        var files = 0
+        var bytes: Int64 = 0
+        let readable = BulkDirectory.read(descriptor, buffer: buffer) { entry in
+            if entry.isDirectory {
+                guard entry.device == device, !entry.isMountPoint else { return }
+                folders.append(Folder(name: entry.name, parent: Int32(folder)))
+                if !entry.isDataless { subdirectories.append((entry.name, folders.count - 1)) }
             } else {
-                let isRegular = (childInfo.st_mode & S_IFMT) == S_IFREG
-                let size = allocatedSize(childInfo, isRegularFile: isRegular)
-                accumulator.addFile(size: size, name: childName, threshold: fileThreshold)
+                let size = allocatedSize(entry)
+                if size >= fileThreshold {
+                    folders[folder].files.append((entry.name, size))
+                } else {
+                    folders[folder].smallBytes += size
+                    folders[folder].smallCount += 1
+                }
                 files += 1
                 bytes += size
             }
         }
-        closedir(directory)
-        context.add(files: files, bytes: bytes)
-
-        var results = [Accumulator?](repeating: nil, count: subdirectories.count)
-        results.withUnsafeMutableBufferPointer { buffer in
-            DispatchQueue.concurrentPerform(iterations: subdirectories.count) { index in
-                let sub = subdirectories[index]
-                buffer[index] = scanDirectory(path: sub.path, name: sub.name, info: sub.info, depth: depth - 1)
+        context.add(files: files, bytes: bytes, unreadable: readable ? 0 : 1)
+        for child in subdirectories {
+            let childPath = path == "/" ? "/" + child.name : path + "/" + child.name
+            if queue.offer(Unit(path: childPath, parentUnit: unit, parentFolder: Int32(child.index))) { continue }
+            let childDescriptor = child.name.withCString { openat(descriptor, $0, BulkDirectory.openFlags) }
+            guard childDescriptor >= 0 else {
+                context.add(files: 0, bytes: 0, unreadable: 1)
+                continue
             }
+            walk(childDescriptor, folder: child.index, path: childPath, unit: unit, device: device,
+                 folders: &folders, queue: queue, buffer: buffer)
+            close(childDescriptor)
+            if context.isCancelled { return }
         }
-        if context.isCancelled { return nil }
-        for case let child? in results {
-            accumulator.absorb(child, threshold: folderThreshold)
-        }
-        return accumulator
     }
 
-    private func walk(path: String, name: String) -> Accumulator? {
-        guard let rootPath = strdup(path) else { return nil }
-        defer { free(rootPath) }
-        var arguments: [UnsafeMutablePointer<CChar>?] = [rootPath, nil]
-        guard let fts = fts_open(&arguments, FTS_PHYSICAL | FTS_NOCHDIR | FTS_XDEV, nil) else { return nil }
-        defer { fts_close(fts) }
-
-        var stack: [Accumulator] = []
-        var levels: [Int] = []
-        var result: Accumulator?
-        var pendingFiles = 0
-        var pendingBytes: Int64 = 0
-        var pendingUnreadable = 0
-        var ticks = 0
-
-        func flush() {
-            context.add(files: pendingFiles, bytes: pendingBytes, unreadable: pendingUnreadable)
-            pendingFiles = 0
-            pendingBytes = 0
-            pendingUnreadable = 0
-        }
-
-        func finish(_ folder: Accumulator) {
-            if stack.isEmpty {
-                result = folder
+    private func merge(_ units: [Unit], _ results: inout [[Folder]]) -> [Folder] {
+        var all: [Folder] = []
+        all.reserveCapacity(results.reduce(0) { $0 + $1.count })
+        var roots = [Int](repeating: 0, count: units.count)
+        var bases = [Int](repeating: 0, count: units.count)
+        for index in results.indices {
+            let local = results[index]
+            results[index] = []
+            guard let head = local.first else { continue }
+            if index == 0 {
+                all.append(head)
             } else {
-                stack[stack.count - 1].absorb(folder, threshold: folderThreshold)
+                let unit = units[index]
+                let root = unit.parentFolder == 0 ? roots[unit.parentUnit] : bases[unit.parentUnit] + Int(unit.parentFolder) - 1
+                roots[index] = root
+                all[root].smallBytes += head.smallBytes
+                all[root].smallCount += head.smallCount
+                all[root].files += head.files
+            }
+            let base = all.count
+            bases[index] = base
+            for var folder in local.dropFirst() {
+                folder.parent = folder.parent == 0 ? Int32(roots[index]) : Int32(base + Int(folder.parent) - 1)
+                all.append(folder)
             }
         }
-
-        while let entry = fts_read(fts) {
-            ticks += 1
-            if ticks & 0xFFF == 0 {
-                flush()
-                if context.isCancelled { return nil }
-            }
-            let kind = Int32(entry.pointee.fts_info)
-            switch kind {
-            case FTS_D:
-                let own = entry.pointee.fts_statp.map { Int64($0.pointee.st_blocks) * 512 } ?? 0
-                if let statPointer = entry.pointee.fts_statp, isDataless(statPointer.pointee) {
-                    // fts then reports the folder as FTS_DP right away without reading it.
-                    fts_set(fts, entry, FTS_SKIP)
-                }
-                pendingBytes += own
-                stack.append(Accumulator(name: stack.isEmpty ? name : entryName(entry), ownBytes: own))
-                levels.append(Int(entry.pointee.fts_level))
-            case FTS_DP:
-                guard let finished = stack.popLast() else { break }
-                levels.removeLast()
-                finish(finished)
-            case FTS_F, FTS_SL, FTS_SLNONE, FTS_DEFAULT:
-                guard let statPointer = entry.pointee.fts_statp, !stack.isEmpty else { break }
-                let size = allocatedSize(statPointer.pointee, isRegularFile: kind == FTS_F)
-                pendingFiles += 1
-                pendingBytes += size
-                stack[stack.count - 1].addFile(size: size, name: entryName(entry), threshold: fileThreshold)
-            case FTS_DNR, FTS_ERR:
-                // A folder that could not be listed (permissions, SIP, privacy protection) comes back
-                // as DNR/ERR instead of DP after its FTS_D; only its own blocks are known.
-                if levels.last == Int(entry.pointee.fts_level), let opened = stack.popLast() {
-                    levels.removeLast()
-                    pendingUnreadable += 1
-                    finish(opened)
-                } else if kind == FTS_DNR {
-                    let own = entry.pointee.fts_statp.map { Int64($0.pointee.st_blocks) * 512 } ?? 0
-                    pendingUnreadable += 1
-                    pendingBytes += own
-                    finish(Accumulator(name: stack.isEmpty ? name : entryName(entry), ownBytes: own))
-                }
-            default:
-                break
-            }
-        }
-        flush()
-        if !stack.isEmpty {
-            // fts_read stopped early on an error: keep everything counted so far.
-            context.add(files: 0, bytes: 0, unreadable: 1)
-            while stack.count > 1 {
-                let unfinished = stack.removeLast()
-                stack[stack.count - 1].absorb(unfinished, threshold: folderThreshold)
-            }
-            result = stack.removeLast()
-        }
-        return result
+        return all
     }
 
-    private func entryName(_ entry: UnsafeMutablePointer<FTSENT>) -> String {
-        let offset = MemoryLayout<FTSENT>.offset(of: \FTSENT.fts_name)!
-        let start = UnsafeRawPointer(entry).advanced(by: offset).assumingMemoryBound(to: UInt8.self)
-        return String(decoding: UnsafeBufferPointer(start: start, count: Int(entry.pointee.fts_namelen)), as: UTF8.self)
+    private func build(_ folders: [Folder], name: String) -> Node {
+        var accumulators = folders.map { folder in
+            var accumulator = Accumulator(name: folder.name, ownBytes: folder.smallBytes)
+            accumulator.smallCount = folder.smallCount
+            accumulator.count = folder.smallCount
+            for file in folder.files {
+                accumulator.addFile(size: file.size, name: file.name, threshold: fileThreshold)
+            }
+            return accumulator
+        }
+        for index in accumulators.indices.reversed() where index > 0 {
+            accumulators[Int(folders[index].parent)].absorb(accumulators[index], threshold: folderThreshold)
+            accumulators[index] = Accumulator(name: "")
+        }
+        accumulators[0].name = name
+        return accumulators[0].makeNode()
     }
 }
