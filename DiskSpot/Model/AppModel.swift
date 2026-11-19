@@ -51,6 +51,8 @@ final class AppModel {
     var searchText = ""
     var inspectorShown = true
     var accessSheetShown = false
+    var inspectorTab: InspectorTab = .overview
+    let cleanup = CleanupStore()
 
     let folderShortcuts: [FolderShortcut] = {
         let home = NSHomeDirectory()
@@ -104,6 +106,45 @@ final class AppModel {
         if ProcessInfo.processInfo.environment["DISKSPOT_NO_SHEET"] != nil { accessSheetShown = false }
         #endif
         rescan()
+        if CommandLine.arguments.contains("--cleanup") { showCleanup() }
+    }
+
+    func showCleanup() {
+        inspectorShown = true
+        inspectorTab = .cleanup
+        NSApp.activate()
+        cleanup.reloadAdvice()
+        if !cleanup.measured { Task { await cleanup.measure() } }
+    }
+
+    func revealPath(_ path: String) {
+        guard let root, let node = root.descendant(at: path, create: false) else { return }
+        select(node)
+    }
+
+    func trashCleanupChoice() async {
+        let advised = cleanup.chosenAdvice
+        let paths = advised.map(\.path) + cleanup.chosenPlaces.map(\.path)
+        cleanup.working = "Перемещаю в Корзину: \(paths.count)"
+        var done: Set<String> = []
+        var errors: [String] = []
+        for path in paths {
+            do {
+                var resulting: NSURL?
+                try FileManager.default.trashItem(at: URL(fileURLWithPath: path), resultingItemURL: &resulting)
+                done.insert(path)
+                if let root, let node = root.descendant(at: path, create: false), canTrash(node) {
+                    moveToTrash(node, trashedPath: (resulting as URL?)?.path)
+                }
+            } catch {
+                errors.append("\(Format.path(path)): \(error.localizedDescription)")
+            }
+        }
+        try? AdviceStore.mark(Set(advised.filter { done.contains($0.path) }.map(\.id)), as: .trashed)
+        cleanup.failures = errors
+        cleanup.working = nil
+        cleanup.reloadAdvice()
+        await cleanup.measure()
     }
 
     // MARK: - Scanning

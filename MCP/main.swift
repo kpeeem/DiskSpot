@@ -36,6 +36,12 @@ folder — the fastest answer to "what filled the disk recently".
 To watch growth over time: disk_snapshot stores an exact measurement, disk_diff \
 says what grew, appeared, shrank or went away since it, and \
 disk_snapshot_forget deletes one.
+
+Cleanup with the user: when asked what to clean, measure first, then call \
+disk_advise with every candidate, a verdict and a reason in the user's language. \
+The DiskSpot app shows it on its cleanup tab and the user removes what they \
+agree with; disk_advice reports what was trashed or kept. Never delete files \
+yourself.
 """
 
 let arguments = Array(CommandLine.arguments.dropFirst())

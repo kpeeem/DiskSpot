@@ -1,3 +1,4 @@
+import Combine
 import SwiftUI
 
 extension Node: Identifiable {
@@ -27,6 +28,12 @@ struct ContentView: View {
         .onChange(of: model.threshold) { model.rescan() }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             model.refreshAccess()
+        }
+        .onReceive(DistributedNotificationCenter.default().publisher(for: Notification.Name(AdviceStore.changedNotification)).receive(on: RunLoop.main)) { _ in
+            model.cleanup.reloadAdvice()
+        }
+        .onReceive(DistributedNotificationCenter.default().publisher(for: Notification.Name(AdviceStore.showNotification)).receive(on: RunLoop.main)) { _ in
+            model.showCleanup()
         }
         .dropDestination(for: URL.self) { urls, _ in
             guard let url = urls.first else { return false }

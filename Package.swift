@@ -29,6 +29,7 @@ let package = Package(
                 "DiskSpot/Model/Node.swift",
                 "DiskSpot/Model/FileKind.swift",
                 "DiskSpot/Model/Format.swift",
+                "DiskSpot/Model/Advice.swift",
                 "DiskSpot/Scanning/ExactScanner.swift",
                 "DiskSpot/Scanning/Spotlight.swift",
                 "DiskSpot/Scanning/Volumes.swift",

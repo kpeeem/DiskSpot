@@ -4,6 +4,25 @@ struct InspectorView: View {
     @Environment(AppModel.self) private var model
 
     var body: some View {
+        @Bindable var model = model
+        VStack(spacing: 0) {
+            Picker("Раздел", selection: $model.inspectorTab) {
+                Text("Обзор").tag(InspectorTab.overview)
+                Text("Уборка").tag(InspectorTab.cleanup)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            if model.inspectorTab == .cleanup {
+                CleanupView()
+            } else {
+                overview
+            }
+        }
+    }
+
+    private var overview: some View {
         Form {
             if let node = model.selection {
                 SelectionSection(node: node)
